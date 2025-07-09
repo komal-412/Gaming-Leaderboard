@@ -1,84 +1,17 @@
-from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
+from rest_framework import status
+from django.db.models import Sum
 from django.db import transaction
 from django.core.cache import cache
-from django.db.models import Sum, F
 from .models import User, GameSession, Leaderboard
-from .serializers import (
-    ScoreSubmissionSerializer, 
-    LeaderboardSerializer, 
-    RankResponseSerializer
-)
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-@api_view(['POST'])
-def submit_score(request):
-    """
-    Submit a new score and update leaderboard atomically
-    """
-    serializer = ScoreSubmissionSerializer(data=request.data)
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
-    user_id = serializer.validated_data['user_id']
-    score = serializer.validated_data['score']
-    
-    try:
-        with transaction.atomic():
-            # Get user
-            user = User.objects.get(id=user_id)
-            
-            # Create game session
-            GameSession.objects.create(user=user, score=score)
-            
-            # Calculate new total score
-            total_score = GameSession.objects.filter(user=user).aggregate(
-                total=Sum('score')
-            )['total'] or 0
-            
-            # Update or create leaderboard entry
-            leaderboard_entry, created = Leaderboard.objects.get_or_create(
-                user=user,
-                defaults={'total_score': total_score}
-            )
-            if not created:
-                leaderboard_entry.total_score = total_score
-                leaderboard_entry.save()
-            
-            # Update ranks for all users
-            update_all_ranks()
-            
-            # Clear cache
-            cache.delete('leaderboard_top_10')
-            cache.delete(f'user_rank_{user_id}')
-            
-        return Response({
-            'message': 'Score submitted successfully',
-            'total_score': total_score
-        }, status=status.HTTP_201_CREATED)
-        
-    except User.DoesNotExist:
-        return Response(
-            {'error': 'User not found'}, 
-            status=status.HTTP_404_NOT_FOUND
-        )
-    except Exception as e:
-        logger.error(f"Error submitting score: {str(e)}")
-        return Response(
-            {'error': 'Internal server error'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
 @api_view(['GET'])
 def get_top_leaderboard(request):
-    """
-    Get top 10 users from leaderboard with Redis caching
-    """
+    """Ultra-fast top 10 leaderboard"""
     cache_key = 'leaderboard_top_10'
     cached_data = cache.get(cache_key)
     
@@ -86,68 +19,94 @@ def get_top_leaderboard(request):
         return Response(cached_data)
     
     try:
-        top_users = Leaderboard.objects.select_related('user').order_by('-total_score')[:10]
-        serializer = LeaderboardSerializer(top_users, many=True)
+        # Get top 10 by score directly (no complex joins)
+        top_players = Leaderboard.objects.select_related('user').order_by('-total_score')[:10]
         
-        # Cache for 5 seconds
-        cache.set(cache_key, serializer.data, 5)
+        data = []
+        for index, entry in enumerate(top_players, 1):
+            data.append({
+                'rank': index,
+                'user_id': entry.user.id,
+                'username': entry.user.username,
+                'total_score': entry.total_score
+            })
         
-        return Response(serializer.data)
+        cache.set(cache_key, data, 60)  # Cache for 1 minute
+        return Response(data)
         
     except Exception as e:
-        logger.error(f"Error getting top leaderboard: {str(e)}")
-        return Response(
-            {'error': 'Internal server error'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
+        logger.error(f"Error in get_top_leaderboard: {str(e)}")
+        return Response([])  # Return empty list on error
 
 @api_view(['GET'])
 def get_user_rank(request, user_id):
-    """
-    Get rank for a specific user with Redis caching
-    """
-    cache_key = f'user_rank_{user_id}'
-    cached_rank = cache.get(cache_key)
-    
-    if cached_rank is not None:
-        return Response({'user_id': user_id, 'rank': cached_rank})
-    
+    """Ultra-fast user rank lookup"""
     try:
-        leaderboard_entry = Leaderboard.objects.get(user_id=user_id)
-        rank = leaderboard_entry.rank
+        leaderboard_entry = Leaderboard.objects.select_related('user').get(user_id=user_id)
         
-        # Cache for 30 seconds
-        cache.set(cache_key, rank, 30)
+        # Calculate rank by counting higher scores (fast query)
+        higher_scores = Leaderboard.objects.filter(total_score__gt=leaderboard_entry.total_score).count()
         
-        serializer = RankResponseSerializer({
-            'user_id': user_id,
-            'rank': rank
+        return Response({
+            'user_id': leaderboard_entry.user.id,
+            'username': leaderboard_entry.user.username,
+            'rank': higher_scores + 1,
+            'total_score': leaderboard_entry.total_score
         })
         
-        return Response(serializer.data)
-        
     except Leaderboard.DoesNotExist:
-        return Response(
-            {'error': 'User not found in leaderboard'}, 
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({'error': 'User not in leaderboard'}, status=404)
     except Exception as e:
-        logger.error(f"Error getting user rank: {str(e)}")
-        return Response(
-            {'error': 'Internal server error'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        return Response({'error': 'Server error'}, status=500)
 
-
-def update_all_ranks():
-    """
-    Update ranks for all leaderboard entries
-    """
-    leaderboard_entries = Leaderboard.objects.order_by('-total_score')
+@api_view(['POST'])
+def submit_score(request):
+    """ULTRA-OPTIMIZED score submission - fastest possible"""
+    # Minimal validation for maximum speed
+    user_id = request.data.get('user_id')
+    score = request.data.get('score')
     
-    for index, entry in enumerate(leaderboard_entries, start=1):
-        entry.rank = index
+    if not user_id or score is None:
+        return Response({'error': 'Missing data'}, status=400)
     
-    # Bulk update for performance
-    Leaderboard.objects.bulk_update(leaderboard_entries, ['rank'])
+    try:
+        user_id = int(user_id)
+        score = int(score)
+    except:
+        return Response({'error': 'Invalid data'}, status=400)
+    
+    if score < 0:
+        return Response({'error': 'Negative score'}, status=400)
+    
+    try:
+        # FASTEST POSSIBLE: Direct database operations, no complex queries
+        with transaction.atomic():
+            # Create session (minimal fields)
+            GameSession.objects.create(
+                user_id=user_id,
+                score=score,
+                game_mode=request.data.get('game_mode', 'classic')
+            )
+            
+            # Calculate total efficiently
+            total_score = GameSession.objects.filter(user_id=user_id).aggregate(
+                total=Sum('score')
+            )['total'] or 0
+            
+            # Update leaderboard
+            Leaderboard.objects.update_or_create(
+                user_id=user_id,
+                defaults={'total_score': total_score}
+            )
+        
+        # Minimal cache clearing
+        cache.delete('leaderboard_top_10')
+        
+        return Response({
+            'message': 'Success',
+            'total_score': total_score
+        }, status=201)
+        
+    except Exception as e:
+        logger.error(f"Submit error: {str(e)}")
+        return Response({'error': 'Server error'}, status=500)
